@@ -1,40 +1,71 @@
 name: Create Issue on Vulnerability in PR
+
 on:
-  pull_request:
-    types: [opened, synchronize]
+  workflow_run:
+    workflows: ["CodeQL Advanced"]   # must exactly match your CodeQL workflow's 'name'
+    types: [completed]
 
 jobs:
   check-alerts-and-file-issue:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       security-events: read
       issues: write
       contents: write
     steps:
-      - name: Wait briefly for Code Scanning to finish
-        run: sleep 15
+      - name: Install jq (if not present)
+        run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Fetch Code Scanning alerts
-        id: cs
+      - name: Figure out PR head branch
+        id: pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Find the PR associated with the workflow_run SHA
+          SHA="${{ github.event.workflow_run.head_sha }}"
+          gh api \
+            "/repos/${{ github.repository }}/commits/$SHA/pulls" \
+            -H "Accept: application/vnd.github+json" > prs.json
+          # take first PR (typical case)
+          head_ref=$(jq -r '.[0].head.ref // empty' prs.json)
+          pr_number=$(jq -r '.[0].number // empty' prs.json)
+          echo "head_ref=$head_ref" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch Code Scanning alerts (for this PR’s branch, CodeQL tool only)
+        id: cs
+        if: ${{ steps.pr.outputs.head_ref != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REF="refs/heads/${{ steps.pr.outputs.head_ref }}"
           gh api -H "Accept: application/vnd.github+json" \
-            "/repos/${{ github.repository }}/code-scanning/alerts?per_page=100&state=open" > cs.json
+            "/repos/${{ github.repository }}/code-scanning/alerts" \
+            --method GET \
+            -f per_page=100 \
+            -f state=open \
+            -f ref="$REF" \
+            -f tool_name=CodeQL \
+            > cs.json
           echo "count=$(jq 'length' cs.json)" >> $GITHUB_OUTPUT
 
       - name: Prep issue body
-        if: steps.cs.outputs.count != '0'
+        if: ${{ steps.cs.outputs.count != '0' }}
         run: |
           {
-            echo "# Open Code Scanning Alerts for PR #${{ github.event.pull_request.number }}"
-            jq -r '.[] | "- **\(.rule.id // .rule?.name // "rule")**: \(.most_recent_instance?.message?.text // "No message") [\(.html_url // "no link")]()"' cs.json
+            echo "# Open Code Scanning Alerts for PR #${{ steps.pr.outputs.pr_number }}"
+            echo
+            jq -r '.[] |
+              "- **\(.rule.id // .rule?.name // "rule")** (\(.severity // "unknown")): \
+               \(.most_recent_instance?.message?.text // "No message") \
+               [View alert](\(.html_url // "#"))"' cs.json
           } > ISSUE_BODY.md
 
       - name: Create Issue
-        if: steps.cs.outputs.count != '0'
+        if: ${{ steps.cs.outputs.count != '0' }}
         uses: peter-evans/create-issue-from-file@v5
         with:
-          title: "Security alerts detected in PR #${{ github.event.pull_request.number }}"
+          title: "Security alerts detected in PR #${{ steps.pr.outputs.pr_number }}"
           content-filepath: ISSUE_BODY.md
           labels: "security, automated"
