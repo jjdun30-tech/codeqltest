@@ -2,7 +2,7 @@ name: Block on open "security" issues
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 jobs:
   gate:
@@ -16,7 +16,7 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Check for blocking security issues tied to this PR
+      - name: Fail if open 'security' Issues are associated with this PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -24,23 +24,31 @@ jobs:
           PR_NUM="${{ github.event.pull_request.number }}"
           PR_URL="${{ github.event.pull_request.html_url }}"
 
-          # We consider an Issue "associated" with this PR if:
-          # 1) it mentions 'PR #<number>' in title/body (your creator uses that), OR
-          # 2) it contains the PR URL in the body.
-          q1="repo:$REPO is:issue is:open label:security \"PR #$PR_NUM\""
-          q2="repo:$REPO is:issue is:open label:security \"$PR_URL\""
+          # 1) Pull open issues with the 'security' label (no Search API)
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/$REPO/issues" \
+            -f state=open \
+            -f labels=security \
+            -f per_page=100 > issues.json
 
-          gh api "/search/issues" -f q="$q1" -f per_page=100 > q1.json
-          gh api "/search/issues" -f q="$q2" -f per_page=100 > q2.json
+          # 2) See if any of those issues mention this PR (either "PR #<num>" or its URL)
+          count=$(jq --arg prnum "$PR_NUM" --arg prurl "$PR_URL" '
+            [ .[] |
+              select(
+                ((.title // "")     | test("PR #"+$prnum))
+                or
+                ((.body // "")      | test("PR #"+$prnum))
+                or
+                ((.title // "")     | contains($prurl))
+                or
+                ((.body // "")      | contains($prurl))
+              )
+            ] | length
+          ' issues.json)
 
-          c1=$(jq '.total_count' q1.json)
-          c2=$(jq '.total_count' q2.json)
-
-          echo "Matches by 'PR #$PR_NUM': $c1"
-          echo "Matches by PR URL:       $c2"
-
-          total=$(( c1 + c2 ))
-          if [ "$total" -gt 0 ]; then
+          echo "Open 'security' issues associated with this PR: $count"
+          if [ "$count" -gt 0 ]; then
             echo "::error title=Blocking security issue(s) found::There are open Issue(s) labeled 'security' associated with this PR."
             exit 1
           fi
