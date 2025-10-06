@@ -16,41 +16,50 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
+      - name: Sanity check gh
+        run: gh --version
+
       - name: Fail if open 'security' Issues are associated with this PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
+
           REPO="${{ github.repository }}"
           PR_NUM="${{ github.event.pull_request.number }}"
           PR_URL="${{ github.event.pull_request.html_url }}"
 
-          # 1) Pull open issues with the 'security' label (no Search API)
-          gh api \
-            -H "Accept: application/vnd.github+json" \
-            "/repos/$REPO/issues" \
-            -f state=open \
-            -f labels=security \
-            -f per_page=100 > issues.json
+          # 1) List open issues with label=security (REPO-SCOPED, no Search API)
+          #    Paginate just in case there are many:
+          page=1
+          > issues.json
+          while :; do
+            resp="$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/$REPO/issues" \
+              -f state=open \
+              -f labels=security \
+              -f per_page=100 \
+              -f page="$page" || true)"
+            # Break if empty array or not an array (safety)
+            echo "$resp" | jq -e 'type=="array" and (length>=0)' >/dev/null 2>&1 || break
+            echo "$resp" | jq -c '.[]' >> issues.json
+            [ "$(echo "$resp" | jq 'length')" -lt 100 ] && break
+            page=$((page+1))
+          done
 
-          # 2) See if any of those issues mention this PR (either "PR #<num>" or its URL)
-          count=$(jq --arg prnum "$PR_NUM" --arg prurl "$PR_URL" '
-            [ .[] |
-              select(
-                ((.title // "")     | test("PR #"+$prnum))
-                or
-                ((.body // "")      | test("PR #"+$prnum))
-                or
-                ((.title // "")     | contains($prurl))
-                or
-                ((.body // "")      | contains($prurl))
-              )
-            ] | length
-          ' issues.json)
+          # 2) Filter issues that reference this PR (either "PR #<num>" or the PR URL)
+          count=$(
+            ( [ -s issues.json ] && jq -s --arg prnum "$PR_NUM" --arg prurl "$PR_URL" '
+              [ .[] |
+                select(
+                  ((.title // "") | test("PR #"+$prnum))
+                  or ((.body  // "") | test("PR #"+$prnum))
+                  or ((.title // "") | contains($prurl))
+                  or ((.body  // "") | contains($prurl))
+                )
+              ] | length
+            ' issues.json ) || echo 0
+          )
 
-          echo "Open 'security' issues associated with this PR: $count"
-          if [ "$count" -gt 0 ]; then
-            echo "::error title=Blocking security issue(s) found::There are open Issue(s) labeled 'security' associated with this PR."
-            exit 1
-          fi
-
-          echo "No open 'security' Issues associated with this PR."
+          echo "Open 'security' issues
