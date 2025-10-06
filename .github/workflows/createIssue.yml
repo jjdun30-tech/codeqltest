@@ -8,48 +8,60 @@ jobs:
   scan-and-create-issue:
     runs-on: ubuntu-latest
     permissions:
-      security-events: read   # For CodeQL
-      contents: write         # To create issues
-      issues: write           # To create issues
-
+      security-events: read   # read code scanning alerts
+      contents: write         # create issue body (if needed)
+      issues: write           # create issues
+      actions: read           # (generally fine to include)
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Setup GitHub CLI
-      uses: cli/gh-action@v2
+      # No setup action needed; gh is preinstalled on hosted runners
 
-    - name: Authenticate GitHub CLI
-      run: echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript, python
 
-    - name: Initialize CodeQL
-      uses: github/codeql-action/init@v3
-      with:
-        languages: 'javascript,python' # adjust as needed
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
 
-    - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v3
+      # Optional: small wait to let alerts register
+      - name: Wait a moment for alerts to appear
+        run: sleep 10
 
-    - name: Check for Vulnerabilities
-      id: check_vulns
-      run: |
-        gh api \
-          -H "Accept: application/vnd.github+json" \
-          /repos/${{ github.repository }}/security/alerts \
-          > alerts.json
-        if [ "$(jq '. | length' alerts.json)" -gt "0" ]; then
-          echo "vulnerabilities found"
-          jq '.' alerts.json > ISSUE_BODY.md
-          echo "vuln_found=true" >> $GITHUB_OUTPUT
-        else
-          echo "No vulnerabilities found"
-          echo "vuln_found=false" >> $GITHUB_OUTPUT
-        fi
+      - name: Check Code Scanning Alerts
+        id: check_vulns
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # required for gh in Actions
+        run: |
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/code-scanning/alerts?per_page=100&state=open" \
+            > alerts.json
 
-    - name: Create Issue from File
-      if: steps.check_vulns.outputs.vuln_found == 'true'
-      uses: peter-evans/create-issue-from-file@v5
-      with:
-        title: "Security Vulnerability Detected in PR #${{ github.event.pull_request.number }}"
-        content-filepath: ISSUE_BODY.md
-        labels: "security, automated"
+          count=$(jq 'length' alerts.json)
+          echo "Found $count open code scanning alerts"
+
+          if [ "$count" -gt "0" ]; then
+            {
+              echo "# Security alerts detected for PR #${{ github.event.pull_request.number }}"
+              echo
+              echo "Repository: ${{ github.repository }}"
+              echo "Branch: ${{ github.head_ref || github.ref_name }}"
+              echo
+              echo "## Open Code Scanning Alerts ($count)"
+              jq -r '.[] | "- **\(.rule.id // .rule?.name // "rule")**: \(.most_recent_instance?.message?.text // "No message") [\(.html_url // "no link")]()"' alerts.json
+            } > ISSUE_BODY.md
+            echo "vuln_found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "vuln_found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Issue from File
+        if: steps.check_vulns.outputs.vuln_found == 'true'
+        uses: peter-evans/create-issue-from-file@v5
+        with:
+          title: "Security Vulnerability Detected in PR #${{ github.event.pull_request.number }}"
+          content-filepath: ISSUE_BODY.md
+          labels: "security, automated"
