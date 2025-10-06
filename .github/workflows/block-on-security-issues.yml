@@ -5,8 +5,7 @@ on:
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
 jobs:
-  gate:
-    name: security-issue-gate
+  security-issue-gate:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -16,8 +15,10 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Sanity check gh
-        run: gh --version
+      - name: Show which workflow is running (debug)
+        run: |
+          echo "workflow: $GITHUB_WORKFLOW"
+          echo "workflow_ref: $GITHUB_WORKFLOW_REF"
 
       - name: Fail if open 'security' Issues are associated with this PR
         env:
@@ -29,37 +30,38 @@ jobs:
           PR_NUM="${{ github.event.pull_request.number }}"
           PR_URL="${{ github.event.pull_request.html_url }}"
 
-          # 1) List open issues with label=security (REPO-SCOPED, no Search API)
-          #    Paginate just in case there are many:
+          # 1) List open issues with label=security (repo-scoped; NO Search API)
           page=1
-          > issues.json
+          : > issues.ndjson
           while :; do
-            resp="$(gh api \
-              -H "Accept: application/vnd.github+json" \
+            resp="$(gh api -H "Accept: application/vnd.github+json" \
               "/repos/$REPO/issues" \
-              -f state=open \
-              -f labels=security \
-              -f per_page=100 \
-              -f page="$page" || true)"
-            # Break if empty array or not an array (safety)
-            echo "$resp" | jq -e 'type=="array" and (length>=0)' >/dev/null 2>&1 || break
-            echo "$resp" | jq -c '.[]' >> issues.json
-            [ "$(echo "$resp" | jq 'length')" -lt 100 ] && break
+              -f state=open -f labels=security -f per_page=100 -f page="$page" || true)"
+            # stop if not an array or empty page
+            if ! echo "$resp" | jq -e 'type=="array"' >/dev/null; then break; fi
+            len=$(echo "$resp" | jq 'length')
+            if [ "$len" -eq 0 ]; then break; fi
+            echo "$resp" | jq -c '.[]' >> issues.ndjson
+            [ "$len" -lt 100 ] && break
             page=$((page+1))
           done
 
-          # 2) Filter issues that reference this PR (either "PR #<num>" or the PR URL)
+          # 2) Count issues that reference this PR number or PR URL in title/body
           count=$(
-            ( [ -s issues.json ] && jq -s --arg prnum "$PR_NUM" --arg prurl "$PR_URL" '
-              [ .[] |
-                select(
-                  ((.title // "") | test("PR #"+$prnum))
-                  or ((.body  // "") | test("PR #"+$prnum))
-                  or ((.title // "") | contains($prurl))
-                  or ((.body  // "") | contains($prurl))
-                )
-              ] | length
-            ' issues.json ) || echo 0
+            ( [ -s issues.ndjson ] && jq -s --arg n "$PR_NUM" --arg u "$PR_URL" '
+              [ .[] | select(
+                  ((.title // "") | test("PR #"+$n))
+                  or ((.body  // "") | test("PR #"+$n))
+                  or ((.title // "") | contains($u))
+                  or ((.body  // "") | contains($u))
+              ) ] | length
+            ' issues.ndjson ) || echo 0
           )
 
-          echo "Open 'security' issues
+          echo "Open 'security' issues associated with PR #$PR_NUM: $count"
+          if [ "$count" -gt 0 ]; then
+            echo "::error title=Blocking security issue(s) found::Open Issue(s) labeled 'security' reference this PR."
+            exit 1
+          fi
+
+          echo "No open 'security' Issues associated with this PR."
