@@ -1,67 +1,40 @@
 name: Create Issue on Vulnerability in PR
-
 on:
   pull_request:
     types: [opened, synchronize]
 
 jobs:
-  scan-and-create-issue:
+  check-alerts-and-file-issue:
     runs-on: ubuntu-latest
     permissions:
-      security-events: write   # read code scanning alerts
-      contents: write         # create issue body (if needed)
-      issues: write           # create issues
-      actions: write           # (generally fine to include)
+      security-events: read
+      issues: write
+      contents: write
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Wait briefly for Code Scanning to finish
+        run: sleep 15
 
-      # No setup action needed; gh is preinstalled on hosted runners
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: javascript, python
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
-
-      # Optional: small wait to let alerts register
-      - name: Wait a moment for alerts to appear
-        run: sleep 10
-
-      - name: Check Code Scanning Alerts
-        id: check_vulns
+      - name: Fetch Code Scanning alerts
+        id: cs
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # required for gh in Actions
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh api \
-            -H "Accept: application/vnd.github+json" \
-            "/repos/${{ github.repository }}/code-scanning/alerts?per_page=100&state=open" \
-            > alerts.json
+          gh api -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/code-scanning/alerts?per_page=100&state=open" > cs.json
+          echo "count=$(jq 'length' cs.json)" >> $GITHUB_OUTPUT
 
-          count=$(jq 'length' alerts.json)
-          echo "Found $count open code scanning alerts"
+      - name: Prep issue body
+        if: steps.cs.outputs.count != '0'
+        run: |
+          {
+            echo "# Open Code Scanning Alerts for PR #${{ github.event.pull_request.number }}"
+            jq -r '.[] | "- **\(.rule.id // .rule?.name // "rule")**: \(.most_recent_instance?.message?.text // "No message") [\(.html_url // "no link")]()"' cs.json
+          } > ISSUE_BODY.md
 
-          if [ "$count" -gt "0" ]; then
-            {
-              echo "# Security alerts detected for PR #${{ github.event.pull_request.number }}"
-              echo
-              echo "Repository: ${{ github.repository }}"
-              echo "Branch: ${{ github.head_ref || github.ref_name }}"
-              echo
-              echo "## Open Code Scanning Alerts ($count)"
-              jq -r '.[] | "- **\(.rule.id // .rule?.name // "rule")**: \(.most_recent_instance?.message?.text // "No message") [\(.html_url // "no link")]()"' alerts.json
-            } > ISSUE_BODY.md
-            echo "vuln_found=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "vuln_found=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Create Issue from File
-        if: steps.check_vulns.outputs.vuln_found == 'true'
+      - name: Create Issue
+        if: steps.cs.outputs.count != '0'
         uses: peter-evans/create-issue-from-file@v5
         with:
-          title: "Security Vulnerability Detected in PR #${{ github.event.pull_request.number }}"
+          title: "Security alerts detected in PR #${{ github.event.pull_request.number }}"
           content-filepath: ISSUE_BODY.md
           labels: "security, automated"
