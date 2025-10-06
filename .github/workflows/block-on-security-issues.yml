@@ -1,0 +1,48 @@
+name: Block on open "security" issues
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  gate:
+    name: security-issue-gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    steps:
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Check for blocking security issues tied to this PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPO="${{ github.repository }}"
+          PR_NUM="${{ github.event.pull_request.number }}"
+          PR_URL="${{ github.event.pull_request.html_url }}"
+
+          # We consider an Issue "associated" with this PR if:
+          # 1) it mentions 'PR #<number>' in title/body (your creator uses that), OR
+          # 2) it contains the PR URL in the body.
+          q1="repo:$REPO is:issue is:open label:security \"PR #$PR_NUM\""
+          q2="repo:$REPO is:issue is:open label:security \"$PR_URL\""
+
+          gh api "/search/issues" -f q="$q1" -f per_page=100 > q1.json
+          gh api "/search/issues" -f q="$q2" -f per_page=100 > q2.json
+
+          c1=$(jq '.total_count' q1.json)
+          c2=$(jq '.total_count' q2.json)
+
+          echo "Matches by 'PR #$PR_NUM': $c1"
+          echo "Matches by PR URL:       $c2"
+
+          total=$(( c1 + c2 ))
+          if [ "$total" -gt 0 ]; then
+            echo "::error title=Blocking security issue(s) found::There are open Issue(s) labeled 'security' associated with this PR."
+            exit 1
+          fi
+
+          echo "No open 'security' Issues associated with this PR."
