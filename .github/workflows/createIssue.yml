@@ -2,7 +2,7 @@ name: Create Issue on Vulnerability in PR
 
 on:
   workflow_run:
-    workflows: ["CodeQL Advanced"]   # must exactly match your CodeQL workflow's 'name'
+    workflows: ["CodeQL", "CodeQL Advanced"]  # must exactly match your CodeQL job's name
     types: [completed]
 
 jobs:
@@ -13,43 +13,61 @@ jobs:
       security-events: read
       issues: write
       contents: write
-      statuses: write
+
     steps:
-      - name: Install jq (if not present)
+      - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Figure out PR head branch
+      - name: Determine PR number and PR ref
         id: pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Find the PR associated with the workflow_run SHA
-          SHA="${{ github.event.workflow_run.head_sha }}"
-          gh api \
-            "/repos/${{ github.repository }}/commits/$SHA/pulls" \
-            -H "Accept: application/vnd.github+json" > prs.json
-          # take first PR (typical case)
-          head_ref=$(jq -r '.[0].head.ref // empty' prs.json)
-          pr_number=$(jq -r '.[0].number // empty' prs.json)
-          echo "head_ref=$head_ref" >> "$GITHUB_OUTPUT"
-          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+          # Prefer the workflow_run payload (fastest)
+          PR_NUM="$(jq -r '.workflow_run.pull_requests[0].number // empty' <<< '${{ toJson(github.event) }}')"
+          HEAD_REF="$(jq -r '.workflow_run.pull_requests[0].head.ref // empty' <<< '${{ toJson(github.event) }}')"
 
-      - name: Fetch Code Scanning alerts (for this PR’s branch, CodeQL tool only)
+          # Fallback: map head_sha -> PR via API (when payload lacks PRs)
+          if [ -z "$PR_NUM" ] || [ -z "$HEAD_REF" ]; then
+            SHA="${{ github.event.workflow_run.head_sha }}"
+            gh api "/repos/${{ github.repository }}/commits/$SHA/pulls" -H "Accept: application/vnd.github+json" > prs.json
+            PR_NUM="$(jq -r '.[0].number // empty' prs.json)"
+            HEAD_REF="$(jq -r '.[0].head.ref // empty' prs.json)"
+          fi
+
+          if [ -z "$PR_NUM" ]; then
+            echo "found=no" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "found=yes" >> $GITHUB_OUTPUT
+          echo "pr_number=$PR_NUM" >> $GITHUB_OUTPUT
+          echo "head_ref=$HEAD_REF" >> $GITHUB_OUTPUT
+          echo "pr_ref=refs/pull/${PR_NUM}/merge" >> $GITHUB_OUTPUT
+
+      - name: Fetch Code Scanning alerts for PR
         id: cs
-        if: ${{ steps.pr.outputs.head_ref != '' }}
+        if: ${{ steps.pr.outputs.found == 'yes' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          REF="refs/heads/${{ steps.pr.outputs.head_ref }}"
-          gh api -H "Accept: application/vnd.github+json" \
-            "/repos/${{ github.repository }}/code-scanning/alerts" \
-            --method GET \
-            -f per_page=100 \
-            -f state=open \
-            -f ref="$REF" \
-            -f tool_name=CodeQL \
-            > cs.json
-          echo "count=$(jq 'length' cs.json)" >> $GITHUB_OUTPUT
+          REF="${{ steps.pr.outputs.pr_ref }}"
+          COUNT=0
+          # small retry: indexing can lag a few seconds
+          for i in 1 2 3 4 5; do
+            gh api -H "Accept: application/vnd.github+json" \
+              "/repos/${{ github.repository }}/code-scanning/alerts" \
+              --method GET \
+              -f per_page=100 \
+              -f state=open \
+              -f ref="$REF" \
+              -f tool_name=CodeQL > cs.json || true
+            COUNT="$(jq 'length' cs.json 2>/dev/null || echo 0)"
+            echo "Attempt $i: $COUNT open alerts on $REF"
+            [ "$COUNT" -gt 0 ] && break
+            sleep 8
+          done
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
 
       - name: Prep issue body
         if: ${{ steps.cs.outputs.count != '0' }}
@@ -59,9 +77,10 @@ jobs:
             echo
             jq -r '.[] |
               "- **\(.rule.id // .rule?.name // "rule")** (\(.severity // "unknown")): \
-               \(.most_recent_instance?.message?.text // "No message") \
-               [View alert](\(.html_url // "#"))"' cs.json
+\(.most_recent_instance?.message?.text // "No message") \
+[View alert](\(.html_url // "#"))"' cs.json
           } > ISSUE_BODY.md
+          sed -n '1,200p' ISSUE_BODY.md
 
       - name: Create Issue
         if: ${{ steps.cs.outputs.count != '0' }}
