@@ -12,16 +12,10 @@ jobs:
   analyze:
     runs-on: ubuntu-latest
     permissions:
-      security-events: write
+      security-events: write   # required by analyze step to upload SARIF
       contents: read
       packages: read
       actions: read
-
-    strategy:
-      fail-fast: false
-      matrix:
-        language: [ python ]
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -32,10 +26,8 @@ jobs:
         uses: github/codeql-action/init@v3
         with:
           languages: python
-          # Optional: keep default queries and also run extended packs
-          # queries: security-extended,security-and-quality
+          # queries: security-extended,security-and-quality  # optional
 
-      # Autobuild is harmless for python - included for parity with examples
       - name: Autobuild
         uses: github/codeql-action/autobuild@v3
         continue-on-error: true
@@ -43,5 +35,67 @@ jobs:
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
         with:
-          # Run the security query category (this is the important change)
           category: "security"
+
+  create_issue_for_pr_alerts:
+    needs: analyze
+    if: ${{ github.event_name == 'pull_request' }}   # only run for PRs
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: read   # read code scanning alerts
+      issues: write           # create issues
+      contents: read
+    steps:
+      - name: Collect PR CodeQL alerts (PR merge ref)
+        id: fetch
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request?.number;
+            if (!prNumber) {
+              core.setOutput('count', '0');
+              return;
+            }
+            const ref = `refs/pull/${prNumber}/merge`;
+
+            const alerts = await github.paginate(
+              github.rest.codeScanning.listAlertsForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                tool_name: 'CodeQL',
+                ref,
+                per_page: 100,
+              }
+            );
+
+            // Build a compact markdown body for the issue
+            const lines = alerts.map(a => {
+              const rule = a.rule?.id || a.rule?.name || 'rule';
+              const sev  = a.severity || 'unknown';
+              const msg  = a.most_recent_instance?.message?.text || 'No message';
+              const url  = a.html_url || '#';
+              return `- **${rule}** (${sev}): ${msg} [View alert](${url})`;
+            });
+
+            core.setOutput('count', String(alerts.length));
+            core.setOutput('body', lines.join('\n'));
+
+      - name: Create Issue (if any alerts)
+        if: ${{ steps.fetch.outputs.count != '0' }}
+        uses: actions/github-script@v7
+        env:
+          BODY: ${{ steps.fetch.outputs.body }}
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const title = `Security alerts detected in PR #${prNumber}`;
+            const body  = `# Open Code Scanning Alerts for PR #${prNumber}\n\n${process.env.BODY}`;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ['security','automated'],
+            });
