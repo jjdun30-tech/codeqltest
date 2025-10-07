@@ -2,7 +2,7 @@ name: Create Issue on Vulnerability in PR
 
 on:
   workflow_run:
-    workflows: ["CodeQL Advanced"]
+    workflows: ["CodeQL Advanced"]   # must exactly match your CodeQL workflow name
     types: [completed]
 
 jobs:
@@ -24,12 +24,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          # Prefer the workflow_run payload
           EVENT_JSON='${{ toJson(github.event) }}'
           PR_NUM="$(jq -r '.workflow_run.pull_requests[0].number // empty' <<< "$EVENT_JSON")"
           HEAD_REF="$(jq -r '.workflow_run.pull_requests[0].head.ref // empty' <<< "$EVENT_JSON")"
 
-          # Fallback via API if payload lacks PRs
           if [[ -z "$PR_NUM" || -z "$HEAD_REF" ]]; then
             SHA="${{ github.event.workflow_run.head_sha }}"
             gh api "/repos/${{ github.repository }}/commits/$SHA/pulls" -H "Accept: application/vnd.github+json" > prs.json
@@ -75,10 +73,7 @@ jobs:
         if: ${{ steps.cs.outputs.count != '0' }}
         shell: bash
         run: |
-          cat > ISSUE_BODY.md <<'EOF'
-# Open Code Scanning Alerts for PR #${{ steps.pr.outputs.pr_number }}
-
-EOF
+          printf '# Open Code Scanning Alerts for PR #%s\n\n' '${{ steps.pr.outputs.pr_number }}' > ISSUE_BODY.md
           jq -r '.[] |
             "- **\(.rule.id // .rule?.name // "rule")** (\(.severity // "unknown")): \
 \(.most_recent_instance?.message?.text // "No message") \
