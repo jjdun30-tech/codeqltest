@@ -1,55 +1,72 @@
 name: Create Issue on Vulnerability in PR
 
 on:
-  pull_request:
-    types: [opened, synchronize]
+  workflow_run:
+    workflows: ["CodeQL Advanced"]   # must exactly match your CodeQL workflow's 'name'
+    types: [completed]
 
 jobs:
-  scan-and-create-issue:
+  check-alerts-and-file-issue:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     permissions:
-      security-events: read   # For CodeQL
-      contents: write         # To create issues
-      issues: write           # To create issues
-
+      security-events: read
+      issues: write
+      contents: write
+      statuses: write
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Install jq (if not present)
+        run: sudo apt-get update && sudo apt-get install -y jq
 
-    - name: Setup GitHub CLI
-      uses: cli/gh-action@v2
+      - name: Figure out PR head branch
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Find the PR associated with the workflow_run SHA
+          SHA="${{ github.event.workflow_run.head_sha }}"
+          gh api \
+            "/repos/${{ github.repository }}/commits/$SHA/pulls" \
+            -H "Accept: application/vnd.github+json" > prs.json
+          # take first PR (typical case)
+          head_ref=$(jq -r '.[0].head.ref // empty' prs.json)
+          pr_number=$(jq -r '.[0].number // empty' prs.json)
+          echo "head_ref=$head_ref" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
 
-    - name: Authenticate GitHub CLI
-      run: echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
+      - name: Fetch Code Scanning alerts (for this PR’s branch, CodeQL tool only)
+        id: cs
+        if: ${{ steps.pr.outputs.head_ref != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REF="refs/heads/${{ steps.pr.outputs.head_ref }}"
+          gh api -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/code-scanning/alerts" \
+            --method GET \
+            -f per_page=100 \
+            -f state=open \
+            -f ref="$REF" \
+            -f tool_name=CodeQL \
+            > cs.json
+          echo "count=$(jq 'length' cs.json)" >> $GITHUB_OUTPUT
 
-    - name: Initialize CodeQL
-      uses: github/codeql-action/init@v3
-      with:
-        languages: 'javascript,python' # adjust as needed
+      - name: Prep issue body
+        if: ${{ steps.cs.outputs.count != '0' }}
+        run: |
+          {
+            echo "# Open Code Scanning Alerts for PR #${{ steps.pr.outputs.pr_number }}"
+            echo
+            jq -r '.[] |
+              "- **\(.rule.id // .rule?.name // "rule")** (\(.severity // "unknown")): \
+               \(.most_recent_instance?.message?.text // "No message") \
+               [View alert](\(.html_url // "#"))"' cs.json
+          } > ISSUE_BODY.md
 
-    - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v3
-
-    - name: Check for Vulnerabilities
-      id: check_vulns
-      run: |
-        gh api \
-          -H "Accept: application/vnd.github+json" \
-          /repos/${{ github.repository }}/security/alerts \
-          > alerts.json
-        if [ "$(jq '. | length' alerts.json)" -gt "0" ]; then
-          echo "vulnerabilities found"
-          jq '.' alerts.json > ISSUE_BODY.md
-          echo "vuln_found=true" >> $GITHUB_OUTPUT
-        else
-          echo "No vulnerabilities found"
-          echo "vuln_found=false" >> $GITHUB_OUTPUT
-        fi
-
-    - name: Create Issue from File
-      if: steps.check_vulns.outputs.vuln_found == 'true'
-      uses: peter-evans/create-issue-from-file@v5
-      with:
-        title: "Security Vulnerability Detected in PR #${{ github.event.pull_request.number }}"
-        content-filepath: ISSUE_BODY.md
-        labels: "security, automated"
+      - name: Create Issue
+        if: ${{ steps.cs.outputs.count != '0' }}
+        uses: peter-evans/create-issue-from-file@v5
+        with:
+          title: "Security alerts detected in PR #${{ steps.pr.outputs.pr_number }}"
+          content-filepath: ISSUE_BODY.md
+          labels: "security, automated"
